@@ -28,6 +28,30 @@ def message_template(role: str, content: Any) -> Dict[str, str]:
     return {'role': role, 'content': str(content)}
 
 
+def print_color(text, color='default'):
+    color_codes = {
+        'default': '\033[39m',
+        'black': '\033[30m',
+        'red': '\033[31m',
+        'green': '\033[32m',
+        'yellow': '\033[33m',
+        'blue': '\033[34m',
+        'magenta': '\033[35m',
+        'cyan': '\033[36m',
+        'light_gray': '\033[37m',
+        'dark_gray': '\033[90m',
+        'light_red': '\033[91m',
+        'light_green': '\033[92m',
+        'light_yellow': '\033[93m',
+        'light_blue': '\033[94m',
+        'light_magenta': '\033[95m',
+        'light_cyan': '\033[96m',
+        'white': '\033[97m',
+    }
+
+    reset_code = '\033[0m'
+    color_code = color_codes.get(color.lower(), color_codes['default'])
+    print(f"{color_code}{text}{reset_code}")
 
 def chat_single(messages: List[Dict[str, str]],
                 mode: str = "",
@@ -63,7 +87,7 @@ def chat_single(messages: List[Dict[str, str]],
             messages=messages
         )
         if verbose:
-            print("response:",response)
+            print_color(response.choices[0].message.content,'blue')
             print(response.choices[0].message.content)
         return json.loads(response.choices[0].message.content)
     elif mode == 'json_few_shot':

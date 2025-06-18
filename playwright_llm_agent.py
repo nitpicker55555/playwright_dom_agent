@@ -4,222 +4,238 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 import yaml
 from chat_py import chat_single, message_template
 import time
+import subprocess
+import os
+
 
 class PageSnapshot:
     def __init__(self, page):
         self.page = page
         self.snapshot_data = None
         self.element_map = {}  # Store mapping from ref to actual elements
-        
-    def capture(self) -> str:
-        """Capture accessibility snapshot of the current page using Playwright's built-in method"""
+        self._last_url = None  # Cache for URL-based optimization
+        self._last_snapshot_hash = None  # Cache for content-based optimization
+
+    def capture(self, force_refresh=False) -> str:
+        """Capture accessibility snapshot of the current page using optimized method"""
         try:
-            # Wait for page to be stable
-            self.page.wait_for_load_state('domcontentloaded', timeout=10000)
-            time.sleep(1)  # Additional wait to ensure page stability
-            
-            try:
-                # Try to use Playwright's built-in method
-                snapshot_text = self.page.evaluate("() => window.playwright?._snapshotForAI?.()")
-                if snapshot_text:
-                    # Add ref attributes to elements for positioning
-                    self._add_ref_attributes()
-                    return f"- Page Snapshot\n```yaml\n{snapshot_text}\n```"
-            except:
-                pass  # If built-in method is not available, fallback to custom method
-            
-            # Fallback to optimized custom method
-            snapshot = self.page.evaluate("""() => {
-                function getOptimizedAccessibilityTree() {
-                    const elements = [];
-                    let refIndex = 0;
-                    
-                    // Priority interactive element selectors
-                    const interactiveSelectors = [
-                        'input', 'button', 'a', 'select', 'textarea', 
-                        '[role="button"]', '[role="link"]', '[role="textbox"]',
-                        '[role="searchbox"]', '[role="combobox"]', '[role="tab"]',
-                        'h1', 'h2', 'h3', 'h4', 'h5', 'h6'
-                    ];
-                    
-                    // Collect all interactive elements
-                    interactiveSelectors.forEach(selector => {
-                        const els = document.querySelectorAll(selector);
-                        els.forEach(element => {
-                            if (elements.some(e => e.element === element)) return; // Avoid duplicates
-                            
-                            const rect = element.getBoundingClientRect();
-                            const isVisible = rect.width > 0 && rect.height > 0 && 
-                                            window.getComputedStyle(element).display !== 'none' &&
-                                            window.getComputedStyle(element).visibility !== 'hidden' &&
-                                            rect.top < window.innerHeight && rect.bottom > 0;
-                            
-                            if (!isVisible) return;
-                            
-                            const role = element.getAttribute('role') || element.tagName.toLowerCase();
-                            const text = element.textContent?.trim() || '';
-                            const ref = `e${refIndex++}`;
-                            
-                            // Add ref attribute to element
-                            element.setAttribute('data-ref', ref);
-                            
-                            // Filter out overly long text and meaningless elements
-                            const filteredText = text.length > 150 ? text.substring(0, 150) + '...' : text;
-                            
-                            // Only include useful elements
-                            if (filteredText.length > 0 || 
-                                ['input', 'button', 'select', 'textarea', 'a'].includes(element.tagName.toLowerCase()) ||
-                                element.hasAttribute('onclick') ||
-                                element.hasAttribute('href')) {
-                                
-                                elements.push({
-                                    element: element,
-                                    role: role,
-                                    name: filteredText,
-                                    ref: ref,
-                                    tag: element.tagName.toLowerCase(),
-                                    attributes: {
-                                        'aria-label': element.getAttribute('aria-label'),
-                                        'placeholder': element.getAttribute('placeholder'),
-                                        'type': element.getAttribute('type'),
-                                        'value': element.value || element.getAttribute('value'),
-                                        'href': element.getAttribute('href'),
-                                        'id': element.getAttribute('id'),
-                                        'class': element.getAttribute('class')?.split(' ').slice(0, 3).join(' '), // Limit class length
-                                        'name': element.getAttribute('name')
-                                    },
-                                    position: {
-                                        x: Math.round(rect.x),
-                                        y: Math.round(rect.y),
-                                        width: Math.round(rect.width),
-                                        height: Math.round(rect.height),
-                                        inViewport: rect.top >= 0 && rect.bottom <= window.innerHeight
-                                    }
-                                });
-                            }
-                        });
-                    });
-                    
-                    // Sort by importance and position
-                    elements.sort((a, b) => {
-                        // Prioritize elements in viewport
-                        if (a.position.inViewport !== b.position.inViewport) {
-                            return b.position.inViewport ? 1 : -1;
-                        }
-                        // Sort by Y coordinate
-                        return a.position.y - b.position.y;
-                    });
-                    
-                    // Limit element count to reduce token usage
-                    const maxElements = 50;
-                    const limitedElements = elements.slice(0, maxElements);
-                    
-                    return limitedElements.map(item => ({
-                        role: item.role,
-                        name: item.name,
-                        ref: item.ref,
-                        tag: item.tag,
-                        attributes: Object.fromEntries(
-                            Object.entries(item.attributes).filter(([k, v]) => v !== null && v !== '')
-                        ),
-                        position: item.position
-                    }));
-                }
-                
-                return getOptimizedAccessibilityTree();
-            }""")
-            
-            # Filter and optimize snapshot data
-            filtered_snapshot = self._filter_snapshot(snapshot)
-            
-            # Convert to simplified YAML format
-            yaml_output = self._format_as_compact_yaml(filtered_snapshot)
-            self.snapshot_data = yaml_output
-            return yaml_output
-            
+            current_url = self.page.url
+
+            # Quick optimization: if URL hasn't changed and we have cached data, return it
+            if not force_refresh and current_url == self._last_url and self.snapshot_data:
+                print("Using cached snapshot (same URL)")
+                return self.snapshot_data
+
+            # Fast page stability check (reduced waiting)
+            start_time = time.time()
+            self.page.wait_for_load_state('domcontentloaded', timeout=5000)
+            print(f"Page load check: {time.time() - start_time:.2f}s")
+
+            # Try direct evaluation first (fastest method)
+            start_time = time.time()
+            snapshot_text = self._get_snapshot_direct()
+            if snapshot_text:
+                print(
+                    f"✅ Direct Python _snapshotForAI: {time.time() - start_time:.2f}s")
+                formatted_snapshot = self._format_snapshot(snapshot_text)
+                self._update_cache(current_url, formatted_snapshot)
+                return formatted_snapshot
+
+            # Fallback to Node.js version (slower but more reliable)
+            start_time = time.time()
+            snapshot_text = self._get_snapshot_via_nodejs()
+            if snapshot_text:
+                print(
+                    f"✅ Node.js _snapshotForAI (official): {time.time() - start_time:.2f}s")
+                formatted_snapshot = self._format_snapshot(snapshot_text)
+                self._update_cache(current_url, formatted_snapshot)
+                return formatted_snapshot
+
+            # Final fallback
+            print("Warning: All snapshot methods failed, using basic fallback")
+            return self._fallback_snapshot()
+
         except Exception as e:
             print(f"Error capturing snapshot: {e}")
             return "Error: Could not capture page snapshot"
-    
-    def _add_ref_attributes(self):
-        """Add ref attributes to existing elements"""
-        self.page.evaluate("""() => {
-            const elements = document.querySelectorAll('input, button, a, select, textarea, h1, h2, h3, h4, h5, h6');
-            elements.forEach((el, index) => {
-                if (!el.hasAttribute('data-ref')) {
-                    el.setAttribute('data-ref', `e${index}`);
+
+    def _get_snapshot_direct(self) -> Optional[str]:
+        """Try to get snapshot directly using page.evaluate (fastest method)"""
+        try:
+            # Try the internal _snapshotForAI method first
+            snapshot_text = self.page.evaluate(
+                "() => window.playwright?._snapshotForAI?.()")
+            if snapshot_text:
+                print("🚀 Using Python page._snapshotForAI() (official method)")
+                print(snapshot_text)
+                return snapshot_text
+            else:
+                print("NO _snapshotForAI Fallback")
+
+            # Try accessibility tree as fallback
+            return self.page.evaluate("""() => {
+                // Simple accessibility-based snapshot
+                function getVisibleElements() {
+                    const elements = [];
+                    const walker = document.createTreeWalker(
+                        document.body,
+                        NodeFilter.SHOW_ELEMENT,
+                        {
+                            acceptNode: function(node) {
+                                const rect = node.getBoundingClientRect();
+                                if (rect.width === 0 || rect.height === 0) return NodeFilter.FILTER_REJECT;
+
+                                const style = window.getComputedStyle(node);
+                                if (style.display === 'none' || style.visibility === 'hidden') {
+                                    return NodeFilter.FILTER_REJECT;
+                                }
+
+                                return NodeFilter.FILTER_ACCEPT;
+                            }
+                        }
+                    );
+
+                    let node;
+                    let refCounter = 1;
+                    while (node = walker.nextNode()) {
+                        const tagName = node.tagName.toLowerCase();
+                        const text = node.textContent?.trim().slice(0, 50) || '';
+
+                        if (['button', 'a', 'input', 'select', 'textarea'].includes(tagName) || 
+                            node.getAttribute('role') || text) {
+
+                            const role = node.getAttribute('role') || 
+                                       (tagName === 'input' ? 'input' : 
+                                        tagName === 'button' ? 'button' :
+                                        tagName === 'a' ? 'link' : 'generic');
+
+                            const ref = `e${refCounter++}`;
+                            const label = text ? `"${text}"` : '';
+                            elements.push(`- ${role} ${label} [ref=${ref}]`);
+
+                            // Add aria-ref for later interaction
+                            node.setAttribute('aria-ref', ref);
+                        }
+                    }
+
+                    return elements.join('\\n');
                 }
-            });
-        }""")
-    
-    def _filter_snapshot(self, snapshot):
-        """Filter snapshot data, remove unimportant information"""
-        filtered = []
-        for item in snapshot:
-            # Skip items without text content and not interactive elements
-            if not item['name'] and item['tag'] not in ['input', 'button', 'select', 'textarea', 'a']:
-                continue
-            
-            # Clean attributes, keep only important ones
-            important_attrs = {}
-            for key, value in item['attributes'].items():
-                if key in ['aria-label', 'placeholder', 'type', 'href', 'id', 'name'] and value:
-                    important_attrs[key] = value
-            
-            filtered.append({
-                'role': item['role'],
-                'name': item['name'],
-                'ref': item['ref'],
-                'tag': item['tag'],
-                'attributes': important_attrs,
-                'inViewport': item['position']['inViewport']
-            })
-        
-        return filtered
-    
-    def _format_as_compact_yaml(self, snapshot_data):
-        """Format snapshot data as compact YAML format"""
-        lines = ["- Page Snapshot (Optimized for LLM)"]
-        
-        viewport_elements = [item for item in snapshot_data if item['inViewport']]
-        other_elements = [item for item in snapshot_data if not item['inViewport']]
-        
-        if viewport_elements:
-            lines.append("  Current Viewport Elements:")
-            for item in viewport_elements[:20]:  # Limit viewport element count
-                lines.append(self._format_element_line(item))
-        
-        if other_elements and len(viewport_elements) < 20:
-            lines.append("  Other Interactive Elements:")
-            remaining_slots = 30 - len(viewport_elements)
-            for item in other_elements[:remaining_slots]:
-                lines.append(self._format_element_line(item))
-        
-        return '\n'.join(lines)
-    
-    def _format_element_line(self, item):
-        """Format single element as concise one line"""
-        parts = [f"    - {item['role']}"]
-        
-        if item['name']:
-            parts.append(f'"{item["name"]}"')
-        
-        # Add important attributes
-        attrs = []
-        for key, value in item['attributes'].items():
-            if key == 'type' and value:
-                attrs.append(f"type={value}")
-            elif key == 'placeholder' and value:
-                attrs.append(f"placeholder={value}")
-            elif key == 'aria-label' and value:
-                attrs.append(f"label={value}")
-        
-        if attrs:
-            parts.append(f"[{', '.join(attrs)}]")
-        
-        parts.append(f"(ref={item['ref']})")
-        
-        return ' '.join(parts)
+
+                return getVisibleElements();
+            }""")
+
+        except Exception as e:
+            print(f"Direct evaluation failed: {e}")
+            return None
+
+    def _format_snapshot(self, snapshot_text: str) -> str:
+        """Format snapshot text consistently"""
+        formatted_snapshot = [
+            "- Page Snapshot",
+            "```yaml",
+            snapshot_text,
+            "```"
+        ]
+        return '\n'.join(formatted_snapshot)
+
+    def _update_cache(self, url: str, snapshot: str):
+        """Update cache with new snapshot data"""
+        self._last_url = url
+        self.snapshot_data = snapshot
+        # Create simple hash for content comparison
+        self._last_snapshot_hash = hash(snapshot)
+
+    def _get_snapshot_via_nodejs(self) -> Optional[str]:
+        """Try to get snapshot using Node.js version of Playwright"""
+        try:
+            # Get current page URL
+            current_url = self.page.url
+
+            # Check if snapshot_helper.js exists
+            script_path = os.path.join(os.getcwd(), 'snapshot_helper.js')
+            if not os.path.exists(script_path):
+                print("snapshot_helper.js not found, skipping Node.js method")
+                return None
+
+            # Set environment to ensure UTF-8 encoding
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            if os.name == 'nt':  # Windows
+                env['CHCP'] = '65001'  # Set code page to UTF-8
+
+            # Call Node.js script with reduced timeout
+            cmd = ['node', 'snapshot_helper.js', 'snapshot', current_url]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,  # Reduced from 30s to 10s
+                encoding='utf-8',
+                errors='replace',
+                env=env
+            )
+
+            if result.returncode == 0:
+                # Parse JSON response
+                response_data = json.loads(result.stdout.strip())
+                if response_data.get('success'):
+                    print(
+                        "🚀 Using Node.js page._snapshotForAI() (official method)")
+                    return response_data.get('snapshot')
+                else:
+                    print(
+                        f"Node.js snapshot failed: {response_data.get('error')}")
+                    return None
+            else:
+                print(
+                    f"Node.js script failed with return code {result.returncode}")
+                if result.stderr:
+                    print(f"Error output: {result.stderr}")
+                return None
+
+        except subprocess.TimeoutExpired:
+            print("Node.js snapshot timeout")
+            return None
+        except FileNotFoundError:
+            print("Node.js not found in PATH")
+            return None
+        except json.JSONDecodeError:
+            print("Failed to parse Node.js response")
+            return None
+        except Exception as e:
+            print(f"Error calling Node.js snapshot: {e}")
+            return None
+
+    def _fallback_snapshot(self) -> str:
+        """Fallback method when _snapshotForAI is not available"""
+        try:
+            # Simple fallback that captures basic page info
+            title = self.page.title()
+            url = self.page.url
+
+            # Get basic text content from body
+            body_text = self.page.evaluate("""() => {
+                const body = document.body;
+                if (!body) return '';
+
+                // Get visible text content, but limit length
+                const text = body.textContent || '';
+                return text.trim().slice(0, 500);
+            }""")
+
+            fallback_snapshot = [
+                "- Page Snapshot",
+                "```yaml",
+                f"- generic [ref=e1]: {body_text}" if body_text else "- generic [ref=e1]: (no content)",
+                "```"
+            ]
+
+            return '\n'.join(fallback_snapshot)
+
+        except Exception as e:
+            print(f"Error in fallback snapshot: {e}")
+            return "Error: Could not capture page snapshot"
+
 
 class PlaywrightLLMAgent:
     def __init__(self):
@@ -230,293 +246,473 @@ class PlaywrightLLMAgent:
         self.snapshot = PageSnapshot(self.page)
         self.plan = None
         self.current_action_index = 0
-        
+        self._cdp_endpoint = None
+
     def navigate(self, url: str) -> str:
         """Navigate to a URL and capture snapshot"""
         try:
             print(f"Navigating to: {url}")
-            self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            
-            # Wait for page to fully load
-            self.page.wait_for_load_state('networkidle', timeout=15000)
-            time.sleep(2)  # Additional wait to ensure page stability
-            
-            print("Page loaded, capturing optimized snapshot...")
-            return self.snapshot.capture()
-            
+            start_time = time.time()
+
+            self.page.goto(url, wait_until='domcontentloaded', timeout=20000)
+
+            # Optimized loading wait - try networkidle but don't block too long
+            try:
+                self.page.wait_for_load_state('networkidle', timeout=5000)
+            except:
+                print("Networkidle timeout, proceeding anyway...")
+
+            print(
+                f"Page loaded in {time.time() - start_time:.2f}s, capturing snapshot...")
+            return self.snapshot.capture(
+                force_refresh=True)  # Force refresh on navigation
+
         except Exception as e:
             print(f"Error navigating to {url}: {e}")
             return "Error: Could not navigate to page"
-    
-    def get_initial_plan(self, prompt: str, snapshot: str) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        """Get initial plan and first action from LLM"""
-        messages = [
-            message_template('system', """You are a web automation assistant. Analyze the optimized page snapshot and create a plan to accomplish the user's request.
 
-The snapshot shows the most important interactive elements on the page. Each element has:
+    def _get_llm_response(self, prompt: str, snapshot: str,
+                          last_action_result: Optional[str] = None,
+                          is_initial: bool = True) -> Optional[Dict[str, Any]]:
+        """Get response from LLM - unified method for prompts"""
+
+        # Common action types description
+        action_types = """
+Available action types:
+- 'click': {"type": "click", "ref": "e1"} or {"type": "click", "text": "Button Text"} or {"type": "click", "selector": "button"}
+- 'type': {"type": "type", "ref": "e1", "text": "search text"} or {"type": "type", "selector": "input", "text": "search text"}
+- 'select': {"type": "select", "ref": "e1", "value": "option"} or {"type": "select", "selector": "select", "value": "option"}
+- 'wait': {"type": "wait", "timeout": 2000} or {"type": "wait", "selector": "#element"}
+- 'scroll': {"type": "scroll", "direction": "down", "amount": 300}
+- 'finish': {"type": "finish", "ref": null, "summary": "task completion summary"}
+
+IMPORTANT: 
+- For 'click': Use 'ref' from snapshot, or 'text' for visible text, or 'selector' for CSS selectors
+- For 'type'/'select': Use 'ref' from snapshot or 'selector' for CSS selectors
+- Only use 'ref' values that exist in the snapshot (e.g., ref=e1, ref=e2, etc.)
+- Use 'finish' when the task is completed successfully with a summary of what was accomplished"""
+
+        if is_initial:
+            system_prompt = """You are a web automation assistant. Analyze the page snapshot and create a plan to accomplish the user's request.
+
+The snapshot shows the page elements in YAML format. Each element has:
 - role: The element type (button, input, link, etc.)
-- name: The visible text or label
+- name/text: The visible text or label
 - attributes: Important properties like type, placeholder, etc.
-- ref: Unique reference for interaction (use this exact value)
+- [ref=eX]: Unique reference for interaction (use this exact value)
 
 Your response should be a JSON object with two fields:
 1. 'plan': An array of high-level steps to accomplish the task
-2. 'action': The first action to take, or null if task is complete
+2. 'action': The first action to take, or use 'finish' action if task is already complete
 
-Action format example:
+Action format examples:
 {
   "plan": ["Step 1", "Step 2"],
   "action": {
     "type": "click",
-    "ref": "e23"
+    "ref": "e1"
   }
 }
 
-Available action types:
-- 'click': {"type": "click", "ref": "e1"}
-- 'type': {"type": "type", "ref": "e1", "text": "search text"}
-- 'select': {"type": "select", "ref": "e1", "value": "option"}
-- 'wait': {"type": "wait", "timeout": 2000} or {"type": "wait", "selector": "#element"}
-- 'extract': {"type": "extract", "ref": "e1", "variable": "result"}
-- 'scroll': {"type": "scroll", "direction": "down", "amount": 300}
-
-IMPORTANT: Only use 'ref' values that exist in the snapshot (e.g., ref=e1, ref=e2, etc.)"""),
-            message_template('user', f"Page Snapshot:\n{snapshot}\n\nUser Request: {prompt}")
-        ]
-        print("snapshot:",snapshot)
-        response = chat_single(messages, mode="json", verbose=True)
-        
-        if response and isinstance(response, dict):
-            plan = response.get('plan', [])
-            action = response.get('action', None)
-            
-            # Fix action format issues
-            if action and isinstance(action, dict):
-                # Check if it's old format {"click": {"ref": "e23"}}
-                if 'type' not in action:
-                    # Try to detect action type
-                    if 'click' in action:
-                        click_value = action['click']
-                        if isinstance(click_value, str):
-                            # Handle {"click": "e23"} format
-                            action = {"type": "click", "ref": click_value}
-                        elif isinstance(click_value, dict):
-                            # Handle {"click": {"ref": "e23"}} format
-                            action = {"type": "click", "ref": click_value.get('ref')}
-                    elif 'type' in action:
-                        type_value = action['type']
-                        if isinstance(type_value, dict):
-                            action = {"type": "type", "ref": type_value.get('ref'), "text": type_value.get('text', '')}
-                    elif 'select' in action:
-                        select_value = action['select']
-                        if isinstance(select_value, dict):
-                            action = {"type": "select", "ref": select_value.get('ref'), "value": select_value.get('value', '')}
-                    elif 'extract' in action:
-                        extract_value = action['extract']
-                        if isinstance(extract_value, dict):
-                            action = {"type": "extract", "ref": extract_value.get('ref'), "variable": extract_value.get('variable', 'result')}
-                    elif 'scroll' in action:
-                        scroll_value = action['scroll']
-                        if isinstance(scroll_value, dict):
-                            action = {"type": "scroll", "direction": scroll_value.get('direction', 'down'), "amount": scroll_value.get('amount', 300)}
-                    elif 'wait' in action:
-                        wait_value = action['wait']
-                        if isinstance(wait_value, dict):
-                            if 'timeout' in wait_value:
-                                action = {"type": "wait", "timeout": wait_value['timeout']}
-                            elif 'selector' in wait_value:
-                                action = {"type": "wait", "selector": wait_value['selector']}
-                            else:
-                                action = {"type": "wait", "timeout": 2000}
-            
-            return plan, action
+If task is already complete:
+{
+  "plan": [],
+  "action": {
+    "type": "finish",
+    "ref": null,
+    "summary": "Task was already completed. Summary of what was found..."
+  }
+}""" + action_types
+            user_prompt = f"Page Snapshot:\n{snapshot}\n\nUser Request: {prompt}"
         else:
-            return [], None
-    
-    def get_next_action(self, prompt: str, snapshot: str, last_action_result: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Get next action from LLM based on current state"""
-        messages = [
-            message_template('system', """You are a web automation assistant. Based on the current optimized page state and the last action's result, suggest the next action.
+            system_prompt = """You are a web automation assistant. Based on the current page state and the last action's result, suggest the next action.
 
-Your response should be a JSON object with a single 'action' field containing the next action to take, or null if the task is complete.
+Your response should be a JSON object with a single 'action' field containing the next action to take. If the task is complete, use the 'finish' action type with a summary.
 
-Action format example:
+Action format examples:
 {
   "action": {
     "type": "click",
-    "ref": "e23"
+    "ref": "e1"
   }
 }
 
-Available action types:
-- 'click': {"type": "click", "ref": "e1"}
-- 'type': {"type": "type", "ref": "e1", "text": "search text"}
-- 'select': {"type": "select", "ref": "e1", "value": "option"}
-- 'wait': {"type": "wait", "timeout": 2000} or {"type": "wait", "selector": "#element"}
-- 'extract': {"type": "extract", "ref": "e1", "variable": "result"}
-- 'scroll': {"type": "scroll", "direction": "down", "amount": 300}
-
-IMPORTANT: Only use 'ref' values that exist in the current snapshot."""),
-            message_template('user', f"""Current Page Snapshot:\n{snapshot}
+When task is complete:
+{
+  "action": {
+    "type": "finish",
+    "ref": null,
+    "summary": "Successfully completed the task. Summary of what was accomplished..."
+  }
+}""" + action_types
+            user_prompt = f"""Current Page Snapshot:\n{snapshot}
 
 Last Action: {last_action_result if last_action_result else 'None'}
 
 User Request: {prompt}
 
-Determine the next action to take or return null if the task is complete.""")
-        ]
-        print("Current snapshot:",snapshot)
+Determine the next action to take. If the task is complete, use 'finish' action with a summary of what was accomplished.
+"""
 
+        messages = [
+            message_template('system', system_prompt),
+            message_template('user', user_prompt)
+        ]
+
+        print(
+            f"Sending {'initial plan' if is_initial else 'next action'} request to LLM")
         response = chat_single(messages, mode="json", verbose=True)
-        
+
+        # Ensure we return a dict or None
+        if isinstance(response, dict):
+            return response
+        else:
+            return None
+
+    def _fix_action_format(self, action: Optional[Dict[str, Any]]) -> Optional[
+        Dict[str, Any]]:
+        """Fix action format issues from LLM response"""
+        if not action or not isinstance(action, dict):
+            return action
+
+        # Check if it's old format {"click": {"ref": "e23"}}
+        if 'type' not in action:
+            # Try to detect action type
+            if 'click' in action:
+                click_value = action['click']
+                if isinstance(click_value, str):
+                    action = {"type": "click", "ref": click_value}
+                elif isinstance(click_value, dict):
+                    action = {"type": "click", "ref": click_value.get('ref')}
+            elif 'type' in action:
+                type_value = action['type']
+                if isinstance(type_value, dict):
+                    action = {"type": "type", "ref": type_value.get('ref'),
+                              "text": type_value.get('text', '')}
+            elif 'select' in action:
+                select_value = action['select']
+                if isinstance(select_value, dict):
+                    action = {"type": "select", "ref": select_value.get('ref'),
+                              "value": select_value.get('value', '')}
+            elif 'extract' in action:
+                extract_value = action['extract']
+                if isinstance(extract_value, dict):
+                    action = {"type": "extract",
+                              "ref": extract_value.get('ref'),
+                              "variable": extract_value.get('variable',
+                                                            'result')}
+            elif 'scroll' in action:
+                scroll_value = action['scroll']
+                if isinstance(scroll_value, dict):
+                    action = {"type": "scroll",
+                              "direction": scroll_value.get('direction',
+                                                            'down'),
+                              "amount": scroll_value.get('amount', 300)}
+            elif 'wait' in action:
+                wait_value = action['wait']
+                if isinstance(wait_value, dict):
+                    if 'timeout' in wait_value:
+                        action = {"type": "wait",
+                                  "timeout": wait_value['timeout']}
+                    elif 'selector' in wait_value:
+                        action = {"type": "wait",
+                                  "selector": wait_value['selector']}
+                    else:
+                        action = {"type": "wait", "timeout": 2000}
+            elif 'finish' in action:
+                finish_value = action['finish']
+                if isinstance(finish_value, dict):
+                    action = {"type": "finish", "ref": None,
+                              "summary": finish_value.get('summary',
+                                                          'Task completed')}
+                else:
+                    action = {"type": "finish", "ref": None, "summary": str(
+                        finish_value) if finish_value else 'Task completed'}
+
+        return action
+
+    def get_initial_plan(self, prompt: str, snapshot: str) -> Tuple[
+        List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Get initial plan and first action from LLM"""
+        response = self._get_llm_response(prompt, snapshot, is_initial=True)
+
+        if response and isinstance(response, dict):
+            plan = response.get('plan', [])
+            action = response.get('action', None)
+            action = self._fix_action_format(action)
+            return plan, action
+        else:
+            return [], None
+
+    def get_next_action(self, prompt: str, snapshot: str,
+                        last_action_result: Optional[str] = None) -> Optional[
+        Dict[str, Any]]:
+        """Get next action from LLM based on current state"""
+        response = self._get_llm_response(prompt, snapshot, last_action_result,
+                                          is_initial=False)
+
         if response and isinstance(response, dict):
             action = response.get('action', None)
-            
-            # Fix action format issues
-            if action and isinstance(action, dict):
-                # Check if it's old format {"click": {"ref": "e23"}}
-                if 'type' not in action:
-                    # Try to detect action type
-                    if 'click' in action:
-                        click_value = action['click']
-                        if isinstance(click_value, str):
-                            # Handle {"click": "e23"} format
-                            action = {"type": "click", "ref": click_value}
-                        elif isinstance(click_value, dict):
-                            # Handle {"click": {"ref": "e23"}} format
-                            action = {"type": "click", "ref": click_value.get('ref')}
-                    elif 'type' in action:
-                        type_value = action['type']
-                        if isinstance(type_value, dict):
-                            action = {"type": "type", "ref": type_value.get('ref'), "text": type_value.get('text', '')}
-                    elif 'select' in action:
-                        select_value = action['select']
-                        if isinstance(select_value, dict):
-                            action = {"type": "select", "ref": select_value.get('ref'), "value": select_value.get('value', '')}
-                    elif 'extract' in action:
-                        extract_value = action['extract']
-                        if isinstance(extract_value, dict):
-                            action = {"type": "extract", "ref": extract_value.get('ref'), "variable": extract_value.get('variable', 'result')}
-                    elif 'scroll' in action:
-                        scroll_value = action['scroll']
-                        if isinstance(scroll_value, dict):
-                            action = {"type": "scroll", "direction": scroll_value.get('direction', 'down'), "amount": scroll_value.get('amount', 300)}
-                    elif 'wait' in action:
-                        wait_value = action['wait']
-                        if isinstance(wait_value, dict):
-                            if 'timeout' in wait_value:
-                                action = {"type": "wait", "timeout": wait_value['timeout']}
-                            elif 'selector' in wait_value:
-                                action = {"type": "wait", "selector": wait_value['selector']}
-                            else:
-                                action = {"type": "wait", "timeout": 2000}
-            
+            action = self._fix_action_format(action)
             return action
         else:
             return None
-    
+
     def wait_for_page_stable(self):
-        """Wait for page to be stable before executing actions"""
+        """Wait for page to be stable before executing actions - optimized"""
         try:
-            self.page.wait_for_load_state('domcontentloaded', timeout=10000)
-            time.sleep(0.5)  # Brief wait to ensure page stability
+            self.page.wait_for_load_state('domcontentloaded', timeout=3000)
+            # Removed sleep for faster execution
         except Exception as e:
             print(f"Warning: Page stability check failed: {e}")
-    
+
+    def execute_manual_action(self, action: Dict[str, Any]) -> str:
+        """Execute manually input action (for demo usage)"""
+        return self.execute_action(action)
+
+    def get_current_snapshot(self) -> str:
+        """Get current page snapshot - optimized for speed"""
+        try:
+            start_time = time.time()
+            # Quick stability check - reduced timeout
+            try:
+                self.page.wait_for_load_state('domcontentloaded', timeout=3000)
+            except:
+                print("Quick stability check timeout, proceeding anyway...")
+
+            print("获取当前页面snapshot...")
+            result = self.snapshot.capture()
+            print(f"Snapshot获取完成，耗时: {time.time() - start_time:.2f}s")
+            return result
+        except Exception as e:
+            print(f"获取snapshot时出错: {e}")
+            return "Error: Could not capture snapshot"
+
     def execute_action(self, action: Dict[str, Any]) -> str:
         """Execute the action suggested by LLM"""
         if not action:
             return "No action to execute"
-            
+
         action_type = action.get('type')
         print(f"Executing action: {action}")
-        
+
         if not action_type:
             return f"Error: No action type specified in {action}"
-        
+
         result = "Unknown action result"
-        
+
         try:
             # Ensure page is stable
             self.wait_for_page_stable()
-            
+
             if action_type == 'click':
                 ref = action.get('ref')
-                if not ref:
-                    return "Error: No ref specified for click action"
-                
-                selector = f"[data-ref='{ref}']"
-                print(f"Clicking element with selector: {selector}")
-                
-                # Check if element exists - fix JavaScript syntax error
-                try:
-                    element_count = self.page.evaluate(f"""
-                        () => document.querySelectorAll("{selector}").length
-                    """)
-                    print(f"Found {element_count} elements with selector {selector}")
-                except Exception as eval_error:
-                    print(f"Error checking element existence: {eval_error}")
-                    # Try simple selector check
+                text = action.get('text')
+                selector = action.get('selector')
+
+                # Need at least one way to find the element
+                if not ref and not text and not selector:
+                    return "Error: No ref, text, or selector specified for click action"
+
+                # Try to find element using multiple strategies
+                success = False
+
+                # Strategy 1: Use provided selector
+                if selector and not success:
                     try:
+                        print(f"Trying to click with selector: {selector}")
                         element_count = self.page.locator(selector).count()
-                        print(f"Using locator count, found {element_count} elements")
-                    except:
-                        element_count = 0
-                
-                if element_count == 0:
-                    # Try to re-add ref attributes
-                    print("Element not found, re-adding ref attributes...")
-                    self.snapshot._add_ref_attributes()
+                        print(f"Found {element_count} elements with selector")
+
+                        if element_count > 0:
+                            self.page.click(selector, timeout=5000,
+                                            force=True)  # 强制点击
+                            success = True
+                            result = f"Successfully clicked element using selector {selector} (force)"
+                    except Exception as e:
+                        print(f"Selector strategy failed: {e}")
+
+                # Strategy 2: Use text content
+                if text and not success:
                     try:
-                        element_count = self.page.locator(selector).count()
-                        print(f"After re-adding refs, found {element_count} elements")
-                    except:
-                        element_count = 0
-                
-                if element_count == 0:
-                    return f"Error: Element with ref '{ref}' not found"
-                
-                # Wait for element to be visible and click
-                self.page.wait_for_selector(selector, timeout=10000)
-                self.page.click(selector, timeout=10000)
-                result = f"Successfully clicked element {ref}"
-                
-                # Wait for page to stabilize after click
-                time.sleep(2)
-                
+                        text_selector = f'text="{text}"'
+                        print(f"Trying to click by text: {text_selector}")
+                        element_count = self.page.locator(
+                            text_selector).count()
+                        print(
+                            f"Found {element_count} elements with text selector")
+
+                        if element_count > 0:
+                            self.page.click(text_selector, timeout=5000,
+                                            force=True)  # 强制点击
+                            success = True
+                            result = f"Successfully clicked element using text '{text}' (force)"
+                    except Exception as e:
+                        print(f"Text strategy failed: {e}")
+
+                # Strategy 3: Try aria-ref attribute
+                if ref and not success:
+                    try:
+                        aria_selector = f"[aria-ref='{ref}']"
+                        print(
+                            f"Trying to click element with aria-ref: {aria_selector}")
+                        element_count = self.page.locator(
+                            aria_selector).count()
+                        print(
+                            f"Found {element_count} elements with aria-ref selector")
+
+                        if element_count > 0:
+                            self.page.click(aria_selector, timeout=5000,
+                                            force=True)  # 强制点击
+                            success = True
+                            result = f"Successfully clicked element {ref} using aria-ref (force)"
+                    except Exception as e:
+                        print(f"aria-ref strategy failed: {e}")
+
+                # Strategy 4: Try to find by extracting text from ref and using text selector
+                if ref and not success:
+                    try:
+                        # Look for text pattern in the most recent snapshot
+                        snapshot_text = self.snapshot.snapshot_data or ""
+                        lines = snapshot_text.split('\n')
+                        target_text = None
+
+                        for line in lines:
+                            if f"[ref={ref}]" in line:
+                                # Extract text from line like: - button "Search" [ref=e123]
+                                import re
+                                match = re.search(r'"([^"]+)"', line)
+                                if match:
+                                    target_text = match.group(1)
+                                    break
+
+                        if target_text:
+                            print(
+                                f"Extracted text from snapshot, trying to click: '{target_text}'")
+                            text_selector = f'text="{target_text}"'
+                            element_count = self.page.locator(
+                                text_selector).count()
+                            print(
+                                f"Found {element_count} elements with extracted text selector")
+
+                            if element_count > 0:
+                                self.page.click(text_selector, timeout=5000,
+                                                force=True)  # 强制点击
+                                success = True
+                                result = f"Successfully clicked element {ref} using extracted text (force)"
+                    except Exception as e:
+                        print(f"Text extraction strategy failed: {e}")
+
+                # Strategy 5: Try common button/link patterns as fallback
+                if not success:
+                    try:
+                        common_selectors = [
+                            'button', 'a', 'input[type="submit"]',
+                            'input[type="button"]', '[role="button"]'
+                        ]
+
+                        for sel in common_selectors:
+                            elements = self.page.locator(sel)
+                            count = elements.count()
+                            if count > 0:
+                                print(
+                                    f"Found {count} {sel} elements, trying the first one")
+                                elements.first.click(timeout=3000,
+                                                     force=True)  # 强制点击
+                                success = True
+                                result = f"Successfully clicked first {sel} element as fallback (force)"
+                                break
+
+                    except Exception as e:
+                        print(f"Fallback strategy failed: {e}")
+
+                if not success:
+                    return f"Error: Could not find and click element"
+
+                # Reduced wait time after click
+                time.sleep(0.5)
+
             elif action_type == 'type':
                 ref = action.get('ref')
                 text = action.get('text', '')
-                
-                if not ref:
-                    return "Error: No ref specified for type action"
-                
-                selector = f"[data-ref='{ref}']"
-                print(f"Typing '{text}' into element with selector: {selector}")
-                
-                # Check if element exists
-                element_count = self.page.locator(selector).count()
-                if element_count == 0:
-                    return f"Error: Element with ref '{ref}' not found"
-                
-                # Wait for element to be visible
-                self.page.wait_for_selector(selector, timeout=10000)
-                self.page.fill(selector, text, timeout=10000)
-                result = f"Successfully typed '{text}' into element {ref}"
-                
+                selector = action.get('selector')
+
+                if not ref and not selector:
+                    return "Error: No ref or selector specified for type action"
+
+                # Try multiple strategies to find input element
+                success = False
+
+                # Strategy 1: Use provided selector
+                if selector and not success:
+                    try:
+                        print(f"Trying to type in selector: {selector}")
+                        element_count = self.page.locator(selector).count()
+                        if element_count > 0:
+                            self.page.fill(selector, text, timeout=5000)
+                            success = True
+                            result = f"Successfully typed '{text}' into selector {selector}"
+                    except Exception as e:
+                        print(f"Selector typing failed: {e}")
+
+                # Strategy 2: Try aria-ref attribute
+                if ref and not success:
+                    try:
+                        aria_selector = f"[aria-ref='{ref}']"
+                        print(f"Trying to type in aria-ref: {aria_selector}")
+                        element_count = self.page.locator(
+                            aria_selector).count()
+                        if element_count > 0:
+                            self.page.fill(aria_selector, text, timeout=5000)
+                            success = True
+                            result = f"Successfully typed '{text}' into element {ref} using aria-ref"
+                    except Exception as e:
+                        print(f"aria-ref typing failed: {e}")
+
+                # Strategy 3: Try common input selectors as fallback
+                if not success:
+                    try:
+                        input_selectors = [
+                            'input[type="text"]', 'input[type="search"]',
+                            'input:not([type])', 'textarea',
+                            '[contenteditable]'
+                        ]
+
+                        for sel in input_selectors:
+                            elements = self.page.locator(sel)
+                            count = elements.count()
+                            if count > 0:
+                                print(
+                                    f"Found {count} {sel} elements, typing into the first one")
+                                elements.first.fill(text, timeout=3000)
+                                success = True
+                                result = f"Successfully typed '{text}' into {sel} element"
+                                break
+
+                    except Exception as e:
+                        print(f"Input fallback strategy failed: {e}")
+
+                if not success:
+                    return f"Error: Could not find input element"
+
             elif action_type == 'select':
                 ref = action.get('ref')
                 value = action.get('value', '')
-                
-                if not ref:
-                    return "Error: No ref specified for select action"
-                
-                selector = f"[data-ref='{ref}']"
-                
-                self.page.wait_for_selector(selector, timeout=10000)
-                self.page.select_option(selector, value, timeout=10000)
-                result = f"Successfully selected '{value}' in element {ref}"
-                
+                selector = action.get('selector')
+
+                if not ref and not selector:
+                    return "Error: No ref or selector specified for select action"
+
+                target_selector = selector or f"[aria-ref='{ref}']"
+
+                try:
+                    self.page.wait_for_selector(target_selector, timeout=10000)
+                    self.page.select_option(target_selector, value,
+                                            timeout=10000)
+                    result = f"Successfully selected '{value}' in element"
+                except Exception as e:
+                    return f"Select operation failed: {e}"
+
             elif action_type == 'wait':
                 if 'timeout' in action:
                     timeout = action['timeout']
@@ -528,21 +724,21 @@ Determine the next action to take or return null if the task is complete.""")
                     result = f"Waited for selector {selector}"
                 else:
                     result = "Error: Wait action requires timeout or selector"
-                    
+
             elif action_type == 'extract':
                 ref = action.get('ref')
-                
+
                 if not ref:
                     return "Error: No ref specified for extract action"
-                
-                selector = f"[data-ref='{ref}']"
-                
+
+                selector = f"[aria-ref='{ref}']"
+
                 self.page.wait_for_selector(selector, timeout=10000)
                 text = self.page.text_content(selector, timeout=10000)
                 if 'variable' in action:
                     setattr(self, action['variable'], text)
                 result = f"Extracted text: {text[:100] if text else 'None'}..."
-                
+
             elif action_type == 'scroll':
                 direction = action.get('direction', 'down')
                 amount = action.get('amount', 300)
@@ -552,85 +748,147 @@ Determine the next action to take or return null if the task is complete.""")
                     self.page.evaluate(f"window.scrollBy(0, -{amount})")
                 result = f"Scrolled {direction} by {amount}px"
                 time.sleep(1)  # Wait after scrolling
-                
+
+            elif action_type == 'finish':
+                summary = action.get('summary', 'Task completed')
+                result = f"Task finished: {summary}"
+
             else:
                 result = f"Error: Unknown action type '{action_type}'"
-                
+
         except Exception as e:
             result = f"Error executing {action_type}: {str(e)}"
             print(f"Action execution error: {e}")
             print(f"Full error details:", e)
-            
-        # Wait for page to stabilize after action, then update snapshot
+
+        # Optimized snapshot update after action
         try:
-            self.wait_for_page_stable()
-            self.snapshot.capture()
+            old_snapshot = self.snapshot.snapshot_data
+            # Use cache if possible, otherwise force refresh
+            updated_snapshot = self.snapshot.capture()
+
+            # Only update if snapshot actually changed
+            if old_snapshot != updated_snapshot:
+                print(
+                    f"Snapshot updated after action. New size: {len(updated_snapshot)} characters")
+            else:
+                print("Snapshot unchanged after action")
         except Exception as e:
             print(f"Error updating snapshot after action: {e}")
-            
+
         return result
-    
+
+    def _should_update_snapshot(self, action: Dict[str, Any]) -> bool:
+        """Determine if snapshot should be updated after this action"""
+        if not action:
+            return False
+
+        action_type = action.get('type', '')
+
+        # Actions that don't change page content
+        non_changing_actions = ['extract', 'wait', 'finish']
+
+        # Actions that might change page content
+        changing_actions = ['click', 'type', 'select', 'scroll']
+
+        return action_type in changing_actions
+
     def process_command(self, prompt: str) -> None:
         """Process a user command through LLM and execute actions"""
         try:
             # 1. Get initial plan
-            snapshot = self.snapshot.capture()
-            if "Error:" in snapshot:
+            current_snapshot = self.snapshot.capture()
+            if "Error:" in current_snapshot:
                 print("Could not capture initial snapshot")
                 return
-                
-            self.plan, action = self.get_initial_plan(prompt, snapshot)
-            print("\nPlan:", json.dumps(self.plan, indent=2, ensure_ascii=False))
-            
+
+            self.plan, action = self.get_initial_plan(prompt, current_snapshot)
+            print("\nPlan:",
+                  json.dumps(self.plan, indent=2, ensure_ascii=False))
+
             # 2. Execute action sequence
             max_actions = 15  # Increase maximum action count
             action_count = 0
-            
+
             while action and action_count < max_actions:
+                # Check if this is a finish action
+                if action.get('type') == 'finish':
+                    print(f"\n🎉 Task completed!")
+                    print(
+                        f"Summary: {action.get('summary', 'No summary provided')}")
+                    return
+
                 # Execute current action
                 result = self.execute_action(action)
-                print(f"\nExecuted action: {json.dumps(action, indent=2, ensure_ascii=False)}")
+                print(
+                    f"\nExecuted action: {json.dumps(action, indent=2, ensure_ascii=False)}")
                 print(f"Result: {result}")
-                
+
                 # If action failed, try to get new snapshot
                 if "Error" in result:
                     print("Action failed, trying to continue...")
                     time.sleep(2)
-                
-                # Get new page state
-                snapshot = self.snapshot.capture()
-                if "Error:" in snapshot:
+                    # Force refresh on error
+                    current_snapshot = self.snapshot.capture(
+                        force_refresh=True)
+                else:
+                    # Smart snapshot update - only if action might have changed the page
+                    if self._should_update_snapshot(action):
+                        print(
+                            "Action might have changed page, capturing fresh snapshot...")
+                        old_snapshot = current_snapshot
+                        current_snapshot = self.snapshot.capture(
+                            force_refresh=True)
+
+                        # Check if snapshot actually changed
+                        if old_snapshot == current_snapshot:
+                            print("Page content unchanged after action")
+                        else:
+                            print(
+                                f"Page updated after action. New size: {len(current_snapshot)} characters")
+                    else:
+                        print(
+                            f"Action '{action.get('type')}' doesn't change page content, reusing snapshot")
+
+                if "Error:" in current_snapshot:
                     print("Could not capture snapshot, stopping...")
                     break
-                
+
                 # Get next action
-                action = self.get_next_action(prompt, snapshot, result)
+                action = self.get_next_action(prompt, current_snapshot, result)
                 action_count += 1
-                
+
             if action_count >= max_actions:
                 print("Reached maximum action limit")
             else:
                 print("Task completed")
-                
+
         except Exception as e:
             print(f"Error in process_command: {e}")
-            
+
     def close(self) -> None:
         """Clean up resources"""
         self.context.close()
         self.browser.close()
         self.playwright.stop()
 
+
 # Usage example
 if __name__ == "__main__":
     agent = PlaywrightLLMAgent()
-    
+
     try:
         # Navigate to target page
-        agent.navigate("https://google.com")
-        
+        agent.navigate("https://books.toscrape.com")
+        question = """
+    "1. Go to the 'Travel' category "
+    "2. Find the cheapest book in that category "
+    "3. Click on that book to view its details "
+    "4. Extract the book's title, price, availability, and star rating "
+    "5. Report your findings in a structured format"
+        """
         # Process user command
-        agent.process_command("search interesting topic in Munich and weather")
-        
+        agent.process_command(question)
+
     finally:
         agent.close() 
