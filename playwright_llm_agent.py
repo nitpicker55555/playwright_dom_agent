@@ -2,7 +2,7 @@ from playwright.sync_api import sync_playwright
 import json
 from typing import Dict, List, Optional, Any, Tuple, Union
 import yaml
-from chat_py import chat_single, message_template
+from chat_py import chat_single, message_template, print_color
 import time
 import subprocess
 import os
@@ -47,6 +47,7 @@ class PageSnapshot:
             if snapshot_text:
                 print(
                     f"✅ Node.js _snapshotForAI (official): {time.time() - start_time:.2f}s")
+                print(snapshot_text)
                 formatted_snapshot = self._format_snapshot(snapshot_text)
                 self._update_cache(current_url, formatted_snapshot)
                 return formatted_snapshot
@@ -61,72 +62,77 @@ class PageSnapshot:
 
     def _get_snapshot_direct(self) -> Optional[str]:
         """Try to get snapshot directly using page.evaluate (fastest method)"""
-        try:
-            # Try the internal _snapshotForAI method first
-            snapshot_text = self.page.evaluate(
-                "() => window.playwright?._snapshotForAI?.()")
-            if snapshot_text:
-                print("🚀 Using Python page._snapshotForAI() (official method)")
-                print(snapshot_text)
-                return snapshot_text
-            else:
-                print("NO _snapshotForAI Fallback")
 
-            # Try accessibility tree as fallback
-            return self.page.evaluate("""() => {
-                // Simple accessibility-based snapshot
-                function getVisibleElements() {
-                    const elements = [];
-                    const walker = document.createTreeWalker(
-                        document.body,
-                        NodeFilter.SHOW_ELEMENT,
-                        {
-                            acceptNode: function(node) {
-                                const rect = node.getBoundingClientRect();
-                                if (rect.width === 0 || rect.height === 0) return NodeFilter.FILTER_REJECT;
+        return self.page.evaluate("""() => {
+            function getVisibleElements() {
+                const elements = [];
 
-                                const style = window.getComputedStyle(node);
-                                if (style.display === 'none' || style.visibility === 'hidden') {
-                                    return NodeFilter.FILTER_REJECT;
-                                }
+                function isVisible(node) {
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) return false;
 
-                                return NodeFilter.FILTER_ACCEPT;
-                            }
-                        }
-                    );
+                    const style = window.getComputedStyle(node);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
 
-                    let node;
-                    let refCounter = 1;
-                    while (node = walker.nextNode()) {
-                        const tagName = node.tagName.toLowerCase();
-                        const text = node.textContent?.trim().slice(0, 50) || '';
-
-                        if (['button', 'a', 'input', 'select', 'textarea'].includes(tagName) || 
-                            node.getAttribute('role') || text) {
-
-                            const role = node.getAttribute('role') || 
-                                       (tagName === 'input' ? 'input' : 
-                                        tagName === 'button' ? 'button' :
-                                        tagName === 'a' ? 'link' : 'generic');
-
-                            const ref = `e${refCounter++}`;
-                            const label = text ? `"${text}"` : '';
-                            elements.push(`- ${role} ${label} [ref=${ref}]`);
-
-                            // Add aria-ref for later interaction
-                            node.setAttribute('aria-ref', ref);
-                        }
-                    }
-
-                    return elements.join('\\n');
+                    return true;
                 }
 
-                return getVisibleElements();
-            }""")
+                function getRole(node) {
+                    const tag = node.tagName.toLowerCase();
+                    const type = node.getAttribute('type');
 
-        except Exception as e:
-            print(f"Direct evaluation failed: {e}")
-            return None
+                    if (node.getAttribute('role')) return node.getAttribute('role');
+
+                    if (tag === 'input') {
+                        if (type === 'checkbox') return 'checkbox';
+                        if (type === 'radio') return 'radio';
+                        return 'input';
+                    }
+
+                    if (tag === 'button') return 'button';
+                    if (tag === 'a') return 'link';
+                    if (tag === 'select') return 'select';
+                    if (tag === 'textarea') return 'textarea';
+                    if (tag === 'p') return 'paragraph';
+                    if (tag === 'span') return 'text';
+
+                    return 'generic';
+                }
+
+                let refCounter = 1;
+
+                function traverse(node, depth) {
+                    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+                    if (!isVisible(node)) return;
+
+                    const tagName = node.tagName.toLowerCase();
+                    const text = node.textContent?.trim().slice(0, 50) || '';
+
+                    const hasRoleOrText = ['button', 'a', 'input', 'select', 'textarea', 'p', 'span'].includes(tagName) || 
+                                          node.getAttribute('role') || text;
+
+                    if (hasRoleOrText) {
+                        const role = getRole(node);
+                        const ref = `e${refCounter++}`;
+                        const label = text ? `"${text}"` : '';
+                        const indent = '\\t'.repeat(depth);
+
+                        elements.push(`${indent}- ${role} ${label} [ref=${ref}]`);
+                        node.setAttribute('aria-ref', ref);
+                    }
+
+                    for (let child of node.children) {
+                        traverse(child, depth + 1);
+                    }
+                }
+
+                traverse(document.body, 0);
+                return elements.join('\\n');
+            }
+
+            return getVisibleElements();
+        }""")
 
     def _format_snapshot(self, snapshot_text: str) -> str:
         """Format snapshot text consistently"""
@@ -247,6 +253,7 @@ class PlaywrightLLMAgent:
         self.plan = None
         self.current_action_index = 0
         self._cdp_endpoint = None
+        self.action_history = []  # Store history of actions and their results
 
     def navigate(self, url: str) -> str:
         """Navigate to a URL and capture snapshot"""
@@ -272,7 +279,7 @@ class PlaywrightLLMAgent:
             return "Error: Could not navigate to page"
 
     def _get_llm_response(self, prompt: str, snapshot: str,
-                          last_action_result: Optional[str] = None,
+                          action_history: Optional[List[Dict[str, Any]]] = None,
                           is_initial: bool = True) -> Optional[Dict[str, Any]]:
         """Get response from LLM - unified method for prompts"""
 
@@ -290,7 +297,9 @@ IMPORTANT:
 - For 'click': Use 'ref' from snapshot, or 'text' for visible text, or 'selector' for CSS selectors
 - For 'type'/'select': Use 'ref' from snapshot or 'selector' for CSS selectors
 - Only use 'ref' values that exist in the snapshot (e.g., ref=e1, ref=e2, etc.)
-- Use 'finish' when the task is completed successfully with a summary of what was accomplished"""
+- Use 'finish' when the task is completed successfully with a summary of what was accomplished
+- click can choose radio, checkbox...
+"""
 
         if is_initial:
             system_prompt = """You are a web automation assistant. Analyze the page snapshot and create a plan to accomplish the user's request.
@@ -325,7 +334,7 @@ If task is already complete:
 }""" + action_types
             user_prompt = f"Page Snapshot:\n{snapshot}\n\nUser Request: {prompt}"
         else:
-            system_prompt = """You are a web automation assistant. Based on the current page state and the last action's result, suggest the next action.
+            system_prompt = """You are a web automation assistant. Based on the current page state and the history of actions taken, suggest the next action.
 
 Your response should be a JSON object with a single 'action' field containing the next action to take. If the task is complete, use the 'finish' action type with a summary.
 
@@ -333,7 +342,8 @@ Action format examples:
 {
   "action": {
     "type": "click",
-    "ref": "e1"
+    "ref": "e1",
+    "reason": ""
   }
 }
 
@@ -345,15 +355,29 @@ When task is complete:
     "summary": "Successfully completed the task. Summary of what was accomplished..."
   }
 }""" + action_types
+            
+            # Format action history
+            history_text = "None"
+            if action_history:
+                history_lines = []
+                for i, entry in enumerate(action_history, 1):
+                    action = entry.get('action', {})
+                    result = entry.get('result', '')
+                    success = entry.get('success', False)
+                    status = "✅ SUCCESS" if success else "❌ FAILED"
+                    history_lines.append(f"{i}. {status} - Action: {json.dumps(action, ensure_ascii=False)} | Result: {result}")
+                history_text = "\n".join(history_lines)
+            
             user_prompt = f"""Current Page Snapshot:\n{snapshot}
 
-Last Action: {last_action_result if last_action_result else 'None'}
+Action History:
+{history_text}
 
 User Request: {prompt}
 
 Determine the next action to take. If the task is complete, use 'finish' action with a summary of what was accomplished.
 """
-
+        print_color(user_prompt,"purple")
         messages = [
             message_template('system', system_prompt),
             message_template('user', user_prompt)
@@ -434,7 +458,7 @@ Determine the next action to take. If the task is complete, use 'finish' action 
     def get_initial_plan(self, prompt: str, snapshot: str) -> Tuple[
         List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """Get initial plan and first action from LLM"""
-        response = self._get_llm_response(prompt, snapshot, is_initial=True)
+        response = self._get_llm_response(prompt, snapshot, action_history=None, is_initial=True)
 
         if response and isinstance(response, dict):
             plan = response.get('plan', [])
@@ -444,11 +468,10 @@ Determine the next action to take. If the task is complete, use 'finish' action 
         else:
             return [], None
 
-    def get_next_action(self, prompt: str, snapshot: str,
-                        last_action_result: Optional[str] = None) -> Optional[
+    def get_next_action(self, prompt: str, snapshot: str) -> Optional[
         Dict[str, Any]]:
         """Get next action from LLM based on current state"""
-        response = self._get_llm_response(prompt, snapshot, last_action_result,
+        response = self._get_llm_response(prompt, snapshot, action_history=self.action_history,
                                           is_initial=False)
 
         if response and isinstance(response, dict):
@@ -796,12 +819,15 @@ Determine the next action to take. If the task is complete, use 'finish' action 
     def process_command(self, prompt: str) -> None:
         """Process a user command through LLM and execute actions"""
         try:
+            # Clear action history for new command
+            self.action_history = []
+            
             # 1. Get initial plan
             current_snapshot = self.snapshot.capture()
             if "Error:" in current_snapshot:
                 print("Could not capture initial snapshot")
                 return
-
+            print_color(current_snapshot,'green')
             self.plan, action = self.get_initial_plan(prompt, current_snapshot)
             print("\nPlan:",
                   json.dumps(self.plan, indent=2, ensure_ascii=False))
@@ -823,6 +849,14 @@ Determine the next action to take. If the task is complete, use 'finish' action 
                 print(
                     f"\nExecuted action: {json.dumps(action, indent=2, ensure_ascii=False)}")
                 print(f"Result: {result}")
+
+                # Record action in history
+                success = "Error" not in result
+                self.action_history.append({
+                    'action': action,
+                    'result': result,
+                    'success': success
+                })
 
                 # If action failed, try to get new snapshot
                 if "Error" in result:
@@ -855,7 +889,7 @@ Determine the next action to take. If the task is complete, use 'finish' action 
                     break
 
                 # Get next action
-                action = self.get_next_action(prompt, current_snapshot, result)
+                action = self.get_next_action(prompt, current_snapshot)
                 action_count += 1
 
             if action_count >= max_actions:
@@ -879,13 +913,16 @@ if __name__ == "__main__":
 
     try:
         # Navigate to target page
-        agent.navigate("https://books.toscrape.com")
+        agent.navigate("https://httpbin.org/forms/post")
         question = """
-    "1. Go to the 'Travel' category "
-    "2. Find the cheapest book in that category "
-    "3. Click on that book to view its details "
-    "4. Extract the book's title, price, availability, and star rating "
-    "5. Report your findings in a structured format"
+    "fill out the form with test data: "
+    "- Customer name: 'John Doe' "
+    "- Telephone: '+1-555-0123' "
+    "- Email: 'john.doe@example.com' "
+    "- Small pizza size "
+    "- Add Choose Onion and mushroom toppings "
+    "Then submit the form and report the response."
+
         """
         # Process user command
         agent.process_command(question)
