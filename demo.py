@@ -5,8 +5,9 @@ import json
 # Use PlaywrightLLMAgent directly instead of maintaining separate code
 class ManualPlaywrightDemo(PlaywrightLLMAgent):
     def __init__(self):
-        super().__init__()
-        
+        super().__init__(
+            user_data_dir=r"D:\User Data"
+        )
     def navigate(self, url: str) -> str:
         """Navigate to a URL and capture snapshot"""
         print(f"正在导航到: {url}")

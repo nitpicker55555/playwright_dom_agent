@@ -6,23 +6,56 @@ from chat_py import chat_single, message_template, print_color
 import time
 import subprocess
 import os
-
+from pathlib import Path
 
 class PageSnapshot:
     def __init__(self, page):
         self.page = page
-        self.snapshot_data = None
+        self.snapshot_data = None  # Last full snapshot (formatted string)
         self.element_map = {}  # Store mapping from ref to actual elements
         self._last_url = None  # Cache for URL-based optimization
         self._last_snapshot_hash = None  # Cache for content-based optimization
 
-    def capture(self, force_refresh=False) -> str:
-        """Capture accessibility snapshot of the current page using optimized method"""
+    def _compute_diff(self, old: str, new: str) -> str:
+        """Return unified diff between two snapshot strings."""
+        import difflib
+
+        old_lines = old.splitlines(keepends=False)
+        new_lines = new.splitlines(keepends=False)
+
+        diff_lines = list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                lineterm="",
+                fromfile="prev",
+                tofile="curr",
+            )
+        )
+
+        if not diff_lines:
+            return "- Page Snapshot (no structural changes)"
+
+        diff_block = ["- Page Snapshot (diff)", "```diff"] + diff_lines + ["```"]
+        return "\n".join(diff_block)
+
+    def capture(self, force_refresh: bool = False, diff_only: bool = False) -> str:
+        """Return the current snapshot.
+
+        Parameters
+        ----------
+        force_refresh : bool, default False
+            Ignore URL/hash cache and rebuild snapshot.
+        diff_only : bool, default False
+            If True *and* a previous snapshot exists, return a unified-diff of
+            changes instead of the full YAML. Always returns full snapshot on
+            first call or when cache is invalid.
+        """
         try:
             current_url = self.page.url
 
-            # Quick optimization: if URL hasn't changed and we have cached data, return it
-            if not force_refresh and current_url == self._last_url and self.snapshot_data:
+            # Short-circuit: unchanged page & caller **not** forcing diff
+            if not force_refresh and current_url == self._last_url and self.snapshot_data and not diff_only:
                 print("Using cached snapshot (same URL)")
                 return self.snapshot_data
 
@@ -38,8 +71,13 @@ class PageSnapshot:
                 print(
                     f"✅ Direct Python _snapshotForAI: {time.time() - start_time:.2f}s")
                 formatted_snapshot = self._format_snapshot(snapshot_text)
+                # Compute diff if requested
+                output_snapshot = formatted_snapshot
+                if diff_only and self.snapshot_data:
+                    output_snapshot = self._compute_diff(self.snapshot_data, formatted_snapshot)  # type: ignore[attr-defined]
+
                 self._update_cache(current_url, formatted_snapshot)
-                return formatted_snapshot
+                return output_snapshot
 
             # Fallback to Node.js version (slower but more reliable)
             start_time = time.time()
@@ -49,12 +87,20 @@ class PageSnapshot:
                     f"✅ Node.js _snapshotForAI (official): {time.time() - start_time:.2f}s")
                 print(snapshot_text)
                 formatted_snapshot = self._format_snapshot(snapshot_text)
+                # Compute diff if requested
+                output_snapshot = formatted_snapshot
+                if diff_only and self.snapshot_data:
+                    output_snapshot = self._compute_diff(self.snapshot_data, formatted_snapshot)  # type: ignore[attr-defined]
+
                 self._update_cache(current_url, formatted_snapshot)
-                return formatted_snapshot
+                return output_snapshot
 
             # Final fallback
             print("Warning: All snapshot methods failed, using basic fallback")
-            return self._fallback_snapshot()
+            fallback = self._fallback_snapshot()
+            if diff_only and self.snapshot_data:
+                fallback = self._compute_diff(self.snapshot_data, fallback)  # type: ignore[attr-defined]
+            return fallback
 
         except Exception as e:
             print(f"Error capturing snapshot: {e}")
@@ -62,77 +108,13 @@ class PageSnapshot:
 
     def _get_snapshot_direct(self) -> Optional[str]:
         """Try to get snapshot directly using page.evaluate (fastest method)"""
-
-        return self.page.evaluate("""() => {
-            function getVisibleElements() {
-                const elements = [];
-
-                function isVisible(node) {
-                    const rect = node.getBoundingClientRect();
-                    if (rect.width === 0 || rect.height === 0) return false;
-
-                    const style = window.getComputedStyle(node);
-                    if (style.display === 'none' || style.visibility === 'hidden') return false;
-
-                    return true;
-                }
-
-                function getRole(node) {
-                    const tag = node.tagName.toLowerCase();
-                    const type = node.getAttribute('type');
-
-                    if (node.getAttribute('role')) return node.getAttribute('role');
-
-                    if (tag === 'input') {
-                        if (type === 'checkbox') return 'checkbox';
-                        if (type === 'radio') return 'radio';
-                        return 'input';
-                    }
-
-                    if (tag === 'button') return 'button';
-                    if (tag === 'a') return 'link';
-                    if (tag === 'select') return 'select';
-                    if (tag === 'textarea') return 'textarea';
-                    if (tag === 'p') return 'paragraph';
-                    if (tag === 'span') return 'text';
-
-                    return 'generic';
-                }
-
-                let refCounter = 1;
-
-                function traverse(node, depth) {
-                    if (node.nodeType !== Node.ELEMENT_NODE) return;
-
-                    if (!isVisible(node)) return;
-
-                    const tagName = node.tagName.toLowerCase();
-                    const text = node.textContent?.trim().slice(0, 50) || '';
-
-                    const hasRoleOrText = ['button', 'a', 'input', 'select', 'textarea', 'p', 'span'].includes(tagName) || 
-                                          node.getAttribute('role') || text;
-
-                    if (hasRoleOrText) {
-                        const role = getRole(node);
-                        const ref = `e${refCounter++}`;
-                        const label = text ? `"${text}"` : '';
-                        const indent = '\\t'.repeat(depth);
-
-                        elements.push(`${indent}- ${role} ${label} [ref=${ref}]`);
-                        node.setAttribute('aria-ref', ref);
-                    }
-
-                    for (let child of node.children) {
-                        traverse(child, depth + 1);
-                    }
-                }
-
-                traverse(document.body, 0);
-                return elements.join('\\n');
-            }
-
-            return getVisibleElements();
-        }""")
+        js_path = Path(__file__).parent / "snapshot.js"
+        try:
+            js_code = js_path.read_text(encoding="utf-8")
+            return self.page.evaluate(js_code)
+        except Exception as e:
+            print(f"Error loading snapshot.js: {e}")
+            return None
 
     def _format_snapshot(self, snapshot_text: str) -> str:
         """Format snapshot text consistently"""
@@ -244,11 +226,44 @@ class PageSnapshot:
 
 
 class PlaywrightLLMAgent:
-    def __init__(self):
+    def __init__(self, user_data_dir: Optional[str] = None):
+        """Create a new Playwright-powered LLM agent.
+
+        Parameters
+        ----------
+        user_data_dir : str, optional
+            Path to a **Chromium user-data directory**. When provided the
+            agent launches a *persistent* browser context so cookies, local
+            storage and other session data are reused across runs. When
+            omitted, a regular incognito context is used.
+        """
+
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=False)
-        self.context = self.browser.new_context()
-        self.page = self.context.new_page()
+
+        if user_data_dir:
+            # Ensure directory exists
+            from pathlib import Path as _Path
+            _path = _Path(user_data_dir)
+            _path.mkdir(parents=True, exist_ok=True)
+
+            # Launch persistent context (returns BrowserContext)
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(_path),
+                headless=False,
+            )
+            # In persistent mode .browser attr is available for later close
+            self.browser = self.context.browser
+        else:
+            # Ephemeral browser+context (previous default behaviour)
+            self.browser = self.playwright.chromium.launch(headless=False)
+            self.context = self.browser.new_context()
+
+        # Create / reuse a page
+        if self.context.pages:
+            self.page = self.context.pages[0]
+        else:
+            self.page = self.context.new_page()
+
         self.snapshot = PageSnapshot(self.page)
         self.plan = None
         self.current_action_index = 0
@@ -291,6 +306,8 @@ Available action types:
 - 'select': {"type": "select", "ref": "e1", "value": "option"} or {"type": "select", "selector": "select", "value": "option"}
 - 'wait': {"type": "wait", "timeout": 2000} or {"type": "wait", "selector": "#element"}
 - 'scroll': {"type": "scroll", "direction": "down", "amount": 300}
+- 'enter': {"type": "enter", "ref": "e1"} or {"type": "enter", "selector": "input[name=q]"} or {"type": "enter"}
+- 'navigate': {"type": "navigate", "url": "https://example.com"}
 - 'finish': {"type": "finish", "ref": null, "summary": "task completion summary"}
 
 IMPORTANT: 
@@ -298,6 +315,8 @@ IMPORTANT:
 - For 'type'/'select': Use 'ref' from snapshot or 'selector' for CSS selectors
 - Only use 'ref' values that exist in the snapshot (e.g., ref=e1, ref=e2, etc.)
 - Use 'finish' when the task is completed successfully with a summary of what was accomplished
+- Use 'enter' to press the Enter key (optionally focus an element first)
+- Use 'navigate' to open a new URL before interacting further
 - click can choose radio, checkbox...
 """
 
@@ -772,6 +791,31 @@ Determine the next action to take. If the task is complete, use 'finish' action 
                 result = f"Scrolled {direction} by {amount}px"
                 time.sleep(1)  # Wait after scrolling
 
+            elif action_type == 'enter':
+                ref = action.get('ref')
+                selector = action.get('selector')
+
+                try:
+                    if ref:
+                        focus_selector = f"[aria-ref='{ref}']"
+                        self.page.focus(focus_selector)
+                    elif selector:
+                        self.page.focus(selector)
+                    # Press Enter globally (works even if already focused)
+                    self.page.keyboard.press("Enter")
+                    result = "Pressed Enter key"
+                    time.sleep(0.5)
+                except Exception as e:
+                    return f"Enter key press failed: {e}"
+
+            elif action_type == 'navigate':
+                url = action.get('url')
+                if not url:
+                    return "Error: No url specified for navigate action"
+
+                nav_snapshot = self.navigate(url)
+                result = f"Navigated to {url}. Snapshot length: {len(nav_snapshot)} chars"
+
             elif action_type == 'finish':
                 summary = action.get('summary', 'Task completed')
                 result = f"Task finished: {summary}"
@@ -812,7 +856,7 @@ Determine the next action to take. If the task is complete, use 'finish' action 
         non_changing_actions = ['extract', 'wait', 'finish']
 
         # Actions that might change page content
-        changing_actions = ['click', 'type', 'select', 'scroll']
+        changing_actions = ['click', 'type', 'select', 'scroll', 'navigate', 'enter']
 
         return action_type in changing_actions
 
@@ -902,27 +946,30 @@ Determine the next action to take. If the task is complete, use 'finish' action 
 
     def close(self) -> None:
         """Clean up resources"""
-        self.context.close()
-        self.browser.close()
+        try:
+            self.context.close()
+        except Exception:
+            pass
+
+        try:
+            # For persistent mode self.browser might already be closed by context.close()
+            if self.browser and self.browser.is_connected():  # type: ignore[attr-defined]
+                self.browser.close()
+        except Exception:
+            pass
+
         self.playwright.stop()
 
 
 # Usage example
 if __name__ == "__main__":
-    agent = PlaywrightLLMAgent()
+    agent = PlaywrightLLMAgent(user_data_dir=r"D:\User Data")
 
     try:
         # Navigate to target page
-        agent.navigate("https://httpbin.org/forms/post")
+        # agent.navigate("")
         question = """
-    "fill out the form with test data: "
-    "- Customer name: 'John Doe' "
-    "- Telephone: '+1-555-0123' "
-    "- Email: 'john.doe@example.com' "
-    "- Small pizza size "
-    "- Add Choose Onion and mushroom toppings "
-    "Then submit the form and report the response."
-
+在Amazon.de找一个最便宜的键盘添加到购物车
         """
         # Process user command
         agent.process_command(question)
