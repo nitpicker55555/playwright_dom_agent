@@ -177,6 +177,15 @@
         }
         node.children = newChildren;
 
+        // Remove child elements that have the same name as their parent
+        if (node.children.length === 1 && typeof node.children[0] !== 'string') {
+            const child = node.children[0];
+            if (child.name && node.name && child.name.trim() === node.name.trim()) {
+                // Merge child's children into parent and remove the redundant child
+                node.children = child.children || [];
+            }
+        }
+
         // A 'generic' role that just wraps a single other element is redundant.
         // We lift its child up to replace it, simplifying the hierarchy.
         const isRedundantWrapper = node.role === 'generic' && node.children.length === 1 && typeof node.children[0] !== 'string';
@@ -192,18 +201,38 @@
      */
     function renderTree(node, indent = '') {
         const lines = [];
-        let props = '';
-        if (node.disabled) props += ' disabled';
-        if (node.checked !== undefined) props += ` checked=${node.checked}`;
-        if (node.expanded !== undefined) props += ` expanded=${node.expanded}`;
-        if (node.ref) props += ` [ref=${node.ref}]`;
+        let meaningfulProps = '';
+        if (node.disabled) meaningfulProps += ' disabled';
+        if (node.checked !== undefined) meaningfulProps += ` checked=${node.checked}`;
+        if (node.expanded !== undefined) meaningfulProps += ` expanded=${node.expanded}`;
+        
+        const ref = node.ref ? ` [ref=${node.ref}]` : '';
+        const name = (node.name || '').replace(/\s+/g, ' ').trim();
+        
+        // Skip elements with empty names and no meaningful props (ref is not considered meaningful)
+        if (!name && !meaningfulProps) {
+            // If element has no name and no meaningful props, render its children directly at current level
+            for (const child of node.children) {
+                if (typeof child === 'string') {
+                    const childText = child.replace(/\s+/g, ' ').trim();
+                    if (childText) { // Only add non-empty text
+                        lines.push(`${indent}- text "${childText}"`);
+                    }
+                } else {
+                    lines.push(...renderTree(child, indent));
+                }
+            }
+            return lines;
+        }
 
-        const name = (node.name || '').replace(/\s+/g, ' ');
-        lines.push(`${indent}- ${node.role}${name ? ` "${name}"` : ''}${props}`);
+        lines.push(`${indent}- ${node.role}${name ? ` "${name}"` : ''}${meaningfulProps}${ref}`);
 
         for (const child of node.children) {
             if (typeof child === 'string') {
-                lines.push(`${indent}  - text "${child.replace(/\s+/g, ' ')}"`);
+                const childText = child.replace(/\s+/g, ' ').trim();
+                if (childText) { // Only add non-empty text
+                    lines.push(`${indent}  - text "${childText}"`);
+                }
             } else {
                 lines.push(...renderTree(child, indent + '  '));
             }
