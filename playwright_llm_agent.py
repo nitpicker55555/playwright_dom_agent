@@ -15,6 +15,7 @@ class PageSnapshot:
         self.element_map = {}  # Store mapping from ref to actual elements
         self._last_url = None  # Cache for URL-based optimization
         self._last_snapshot_hash = None  # Cache for content-based optimization
+        self._last_direct_error: Optional[str] = None  # Store last error from direct snapshot
 
     def _compute_diff(self, old: str, new: str) -> str:
         """Return unified diff between two snapshot strings."""
@@ -39,25 +40,27 @@ class PageSnapshot:
         diff_block = ["- Page Snapshot (diff)", "```diff"] + diff_lines + ["```"]
         return "\n".join(diff_block)
 
-    def capture(self, force_refresh: bool = False, diff_only: bool = False) -> str:
+    def capture(self, force_refresh: bool = False, diff_only: bool = False,
+                include_all: bool = False) -> str:
         """Return the current snapshot.
 
-        Parameters
-        ----------
-        force_refresh : bool, default False
-            Ignore URL/hash cache and rebuild snapshot.
-        diff_only : bool, default False
-            If True *and* a previous snapshot exists, return a unified-diff of
-            changes instead of the full YAML. Always returns full snapshot on
-            first call or when cache is invalid.
-        """
+
+     Parameters
+     ----------
+     force_refresh : bool, default False
+         Ignore URL/hash cache and rebuild snapshot.
+     diff_only : bool, default False
+         If True *and* a previous snapshot exists, return a unified-diff of
+         changes instead of the full YAML. Always returns full snapshot on
+         first call or when cache is invalid.
+     """
         try:
             current_url = self.page.url
 
             # Short-circuit: unchanged page & caller **not** forcing diff
-            if not force_refresh and current_url == self._last_url and self.snapshot_data and not diff_only:
-                print("Using cached snapshot (same URL)")
-                return self.snapshot_data
+            # if not force_refresh and current_url == self._last_url and self.snapshot_data and not diff_only:
+            #     print("Using cached snapshot (same URL)")
+            #     return self.snapshot_data
 
             # Fast page stability check (reduced waiting)
             start_time = time.time()
@@ -66,7 +69,8 @@ class PageSnapshot:
 
             # Try direct evaluation first (fastest method)
             start_time = time.time()
-            snapshot_text = self._get_snapshot_direct()
+            snapshot_text = self._get_snapshot_direct(all_elements=include_all)
+
             if snapshot_text:
                 print(
                     f"✅ Direct Python _snapshotForAI: {time.time() - start_time:.2f}s")
@@ -80,20 +84,20 @@ class PageSnapshot:
                 return output_snapshot
 
             # Fallback to Node.js version (slower but more reliable)
-            start_time = time.time()
-            snapshot_text = self._get_snapshot_via_nodejs()
-            if snapshot_text:
-                print(
-                    f"✅ Node.js _snapshotForAI (official): {time.time() - start_time:.2f}s")
-                print(snapshot_text)
-                formatted_snapshot = self._format_snapshot(snapshot_text)
-                # Compute diff if requested
-                output_snapshot = formatted_snapshot
-                if diff_only and self.snapshot_data:
-                    output_snapshot = self._compute_diff(self.snapshot_data, formatted_snapshot)  # type: ignore[attr-defined]
-
-                self._update_cache(current_url, formatted_snapshot)
-                return output_snapshot
+            # start_time = time.time()
+            # snapshot_text = self._get_snapshot_via_nodejs()
+            # if snapshot_text:
+            #     print(
+            #         f"✅ Node.js _snapshotForAI (official): {time.time() - start_time:.2f}s")
+            #     print(snapshot_text)
+            #     formatted_snapshot = self._format_snapshot(snapshot_text)
+            #     # Compute diff if requested
+            #     output_snapshot = formatted_snapshot
+            #     if diff_only and self.snapshot_data:
+            #         output_snapshot = self._compute_diff(self.snapshot_data, formatted_snapshot)  # type: ignore[attr-defined]
+            #
+            #     self._update_cache(current_url, formatted_snapshot)
+            #     return output_snapshot
 
             # Final fallback
             print("Warning: All snapshot methods failed, using basic fallback")
@@ -106,14 +110,22 @@ class PageSnapshot:
             print(f"Error capturing snapshot: {e}")
             return "Error: Could not capture page snapshot"
 
-    def _get_snapshot_direct(self) -> Optional[str]:
+    def _get_snapshot_direct(self, all_elements: bool = False) -> Optional[str]:
         """Try to get snapshot directly using page.evaluate (fastest method)"""
-        js_path = Path(__file__).parent / "snapshot.js"
+        # Choose appropriate JS snapshot implementation
+        js_filename = "snapshot_complete.js" if all_elements else "snapshot.js"
+        js_path = Path(__file__).parent / js_filename
+
         try:
             js_code = js_path.read_text(encoding="utf-8")
-            return self.page.evaluate(js_code)
+
+            result = self.page.evaluate(js_code)
+
+            return result
         except Exception as e:
-            print(f"Error loading snapshot.js: {e}")
+            err_msg = str(e)
+            self._last_direct_error = err_msg
+            print(f"Error evaluating {js_filename}: {err_msg}")
             return None
 
     def _format_snapshot(self, snapshot_text: str) -> str:
@@ -512,20 +524,74 @@ Determine the next action to take. If the task is complete, use 'finish' action 
         """Execute manually input action (for demo usage)"""
         return self.execute_action(action)
 
-    def get_current_snapshot(self) -> str:
-        """Get current page snapshot - optimized for speed"""
+    def get_current_snapshot(self, *, method: str = "auto",
+                             include_all: bool = False) -> str:
+        """Return a snapshot of the current page.
+
+        Parameters
+        ----------
+        method : {"auto", "direct", "node"}, default "auto"
+            "auto"   – Use `PageSnapshot.capture` (tries direct first, then Node.js, then fallback).
+            "direct" – Force the inline JS `_get_snapshot_direct` path.
+            "node"   – Force the Node.js `_get_snapshot_via_nodejs` path.
+
+        include_all : bool, default False
+            Only applies when ``method`` is "direct" (or "auto" which eventually calls direct).
+            When True, the snapshot includes **all** visible elements (ignores priority/line limit).
+        """
+
         try:
             start_time = time.time()
-            # Quick stability check - reduced timeout
+
+            # Quick stability check – keep short to avoid blocking
             try:
                 self.page.wait_for_load_state('domcontentloaded', timeout=3000)
-            except:
-                print("Quick stability check timeout, proceeding anyway...")
+            except Exception:
+                print("Quick stability check timeout, proceeding anyway…")
 
-            print("获取当前页面snapshot...")
-            result = self.snapshot.capture()
-            print(f"Snapshot获取完成，耗时: {time.time() - start_time:.2f}s")
+            print("获取当前页面snapshot… (method:", method, ")")
+
+            # ---------------------------------------------
+            # Forced methods
+            # ---------------------------------------------
+            if method == "node":
+                snapshot_text = self.snapshot._get_snapshot_via_nodejs()
+                if snapshot_text:
+                    formatted = self.snapshot._format_snapshot(snapshot_text)
+                    self.snapshot._update_cache(self.page.url, formatted)
+                    print(
+                        f"Snapshot获取完成 (Node.js)，耗时: {time.time() - start_time:.2f}s")
+                    return formatted
+                else:
+                    print(
+                        "Node.js snapshot failed, falling back to auto capture…")
+
+            elif method == "direct":
+                snapshot_text = self.snapshot._get_snapshot_direct(
+                    all_elements=include_all)
+                if snapshot_text:
+                    formatted = self.snapshot._format_snapshot(snapshot_text)
+                    self.snapshot._update_cache(self.page.url, formatted)
+                    print(
+                        f"Snapshot获取完成 (direct)，耗时: {time.time() - start_time:.2f}s")
+                    return formatted
+                else:
+                    print(
+                        "Direct snapshot failed, falling back to auto capture…")
+
+            elif method != "auto":
+                print(
+                    f"Warning: Unknown snapshot method '{method}', defaulting to 'auto'.")
+
+            # ---------------------------------------------
+            # Auto / fallback path – uses built-in capture which already
+            # respects the include_all flag for direct snapshot.
+            # ---------------------------------------------
+            result = self.snapshot.capture(include_all=include_all)
+            print(
+                f"Snapshot获取完成 (auto)，耗时: {time.time() - start_time:.2f}s")
             return result
+
         except Exception as e:
             print(f"获取snapshot时出错: {e}")
             return "Error: Could not capture snapshot"

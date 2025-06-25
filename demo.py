@@ -17,10 +17,11 @@ class ManualPlaywrightDemo(PlaywrightLLMAgent):
         """Execute manually input action - delegates to parent class"""
         print(f"执行操作: {action}")
         return super().execute_manual_action(action)
-    
-    def get_current_snapshot(self) -> str:
-        """Get current page snapshot - delegates to parent class"""
-        return super().get_current_snapshot()
+
+    def get_current_snapshot(self, *, method: str = "auto",
+                             include_all: bool = False) -> str:
+        return super().get_current_snapshot(method=method,
+                                            include_all=include_all)
 
 def parse_command(command_str: str) -> Optional[Dict[str, Any]]:
     """Parse space-separated command string into action dictionary"""
@@ -179,9 +180,25 @@ def main():
             elif user_input.lower() == 'help':
                 print_help()
                 continue
-            elif user_input.lower() == 'snapshot':
-                print("正在获取当前页面snapshot...")
-                snapshot = demo.get_current_snapshot()
+            elif user_input.lower().startswith('snapshot'):
+                # 格式: snapshot [method] [all]
+                parts = user_input.split()
+                method = 'auto'
+                include_all = False
+
+                for p in parts[1:]:
+                    p_lower = p.lower()
+                    if p_lower in ('auto', 'direct', 'node'):
+                        method = p_lower
+                    elif p_lower in ('all', 'full', 'include_all', 'complete'):
+                        include_all = True
+                    else:
+                        print(f"警告: 未知snapshot参数 '{p}', 将被忽略")
+
+                print(
+                    f"正在获取当前页面snapshot… (method={method}, include_all={include_all})")
+                snapshot = demo.get_current_snapshot(method=method,
+                                                     include_all=include_all)
                 print("当前Snapshot:")
                 print(snapshot)
                 continue
