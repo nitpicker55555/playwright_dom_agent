@@ -153,9 +153,34 @@
                 }
             }
 
-            // FIX: If an element's name is the same as its only text child, remove the redundant child.
-            if (ariaNode && ariaNode.children.length === 1 && typeof ariaNode.children[0] === 'string' && ariaNode.name === ariaNode.children[0]) {
-                ariaNode.children = [];
+            // FIX: Remove redundant text children that match the element's name
+            if (ariaNode && ariaNode.children.length > 0) {
+                // Remove text children that are the same as the parent's name or are contained in it
+                ariaNode.children = ariaNode.children.filter(child => {
+                    if (typeof child === 'string') {
+                        const childText = child.trim();
+                        const parentName = ariaNode.name.trim();
+                        
+                        // Remove if text child exactly matches parent name
+                        if (childText === parentName) {
+                            return false;
+                        }
+                        
+                        // Also remove if the child text is completely contained in parent name
+                        // and represents a significant portion (to avoid removing important partial text)
+                        if (childText.length > 3 && parentName.includes(childText)) {
+                            return false;
+                        }
+                        
+                        return true;
+                    }
+                    return true;
+                });
+                
+                // If after filtering, we have only one text child that equals the name, remove it
+                if (ariaNode.children.length === 1 && typeof ariaNode.children[0] === 'string' && ariaNode.name === ariaNode.children[0]) {
+                    ariaNode.children = [];
+                }
             }
         }
 
@@ -178,6 +203,24 @@
         node.children = newChildren;
 
         // Remove child elements that have the same name as their parent
+        const filteredChildren = [];
+        for (const child of node.children) {
+            if (typeof child !== 'string' && child.name && node.name) {
+                const childName = child.name.trim();
+                const parentName = node.name.trim();
+                if (childName === parentName) {
+                    // If child has same name as parent, merge its children into parent
+                    filteredChildren.push(...(child.children || []));
+                } else {
+                    filteredChildren.push(child);
+                }
+            } else {
+                filteredChildren.push(child);
+            }
+        }
+        node.children = filteredChildren;
+
+        // Also handle the case where we have only one child with same name
         if (node.children.length === 1 && typeof node.children[0] !== 'string') {
             const child = node.children[0];
             if (child.name && node.name && child.name.trim() === node.name.trim()) {

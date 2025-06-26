@@ -7,234 +7,9 @@ import time
 import subprocess
 import os
 from pathlib import Path
-
-class PageSnapshot:
-    def __init__(self, page):
-        self.page = page
-        self.snapshot_data = None  # Last full snapshot (formatted string)
-        self.element_map = {}  # Store mapping from ref to actual elements
-        self._last_url = None  # Cache for URL-based optimization
-        self._last_snapshot_hash = None  # Cache for content-based optimization
-        self._last_direct_error: Optional[str] = None  # Store last error from direct snapshot
-
-    def _compute_diff(self, old: str, new: str) -> str:
-        """Return unified diff between two snapshot strings."""
-        import difflib
-
-        old_lines = old.splitlines(keepends=False)
-        new_lines = new.splitlines(keepends=False)
-
-        diff_lines = list(
-            difflib.unified_diff(
-                old_lines,
-                new_lines,
-                lineterm="",
-                fromfile="prev",
-                tofile="curr",
-            )
-        )
-
-        if not diff_lines:
-            return "- Page Snapshot (no structural changes)"
-
-        diff_block = ["- Page Snapshot (diff)", "```diff"] + diff_lines + ["```"]
-        return "\n".join(diff_block)
-
-    def capture(self, force_refresh: bool = False, diff_only: bool = False,
-                include_all: bool = False) -> str:
-        """Return the current snapshot.
+from snapshot import PageSnapshot
 
 
-     Parameters
-     ----------
-     force_refresh : bool, default False
-         Ignore URL/hash cache and rebuild snapshot.
-     diff_only : bool, default False
-         If True *and* a previous snapshot exists, return a unified-diff of
-         changes instead of the full YAML. Always returns full snapshot on
-         first call or when cache is invalid.
-     """
-        try:
-            current_url = self.page.url
-
-            # Short-circuit: unchanged page & caller **not** forcing diff
-            # if not force_refresh and current_url == self._last_url and self.snapshot_data and not diff_only:
-            #     print("Using cached snapshot (same URL)")
-            #     return self.snapshot_data
-
-            # Fast page stability check (reduced waiting)
-            start_time = time.time()
-            self.page.wait_for_load_state('domcontentloaded', timeout=5000)
-            print(f"Page load check: {time.time() - start_time:.2f}s")
-
-            # Try direct evaluation first (fastest method)
-            start_time = time.time()
-            snapshot_text = self._get_snapshot_direct(all_elements=include_all)
-
-            if snapshot_text:
-                print(
-                    f"✅ Direct Python _snapshotForAI: {time.time() - start_time:.2f}s")
-                formatted_snapshot = self._format_snapshot(snapshot_text)
-                # Compute diff if requested
-                output_snapshot = formatted_snapshot
-                if diff_only and self.snapshot_data:
-                    output_snapshot = self._compute_diff(self.snapshot_data, formatted_snapshot)  # type: ignore[attr-defined]
-
-                self._update_cache(current_url, formatted_snapshot)
-                return output_snapshot
-
-            # Fallback to Node.js version (slower but more reliable)
-            # start_time = time.time()
-            # snapshot_text = self._get_snapshot_via_nodejs()
-            # if snapshot_text:
-            #     print(
-            #         f"✅ Node.js _snapshotForAI (official): {time.time() - start_time:.2f}s")
-            #     print(snapshot_text)
-            #     formatted_snapshot = self._format_snapshot(snapshot_text)
-            #     # Compute diff if requested
-            #     output_snapshot = formatted_snapshot
-            #     if diff_only and self.snapshot_data:
-            #         output_snapshot = self._compute_diff(self.snapshot_data, formatted_snapshot)  # type: ignore[attr-defined]
-            #
-            #     self._update_cache(current_url, formatted_snapshot)
-            #     return output_snapshot
-
-            # Final fallback
-            print("Warning: All snapshot methods failed, using basic fallback")
-            fallback = self._fallback_snapshot()
-            if diff_only and self.snapshot_data:
-                fallback = self._compute_diff(self.snapshot_data, fallback)  # type: ignore[attr-defined]
-            return fallback
-
-        except Exception as e:
-            print(f"Error capturing snapshot: {e}")
-            return "Error: Could not capture page snapshot"
-
-    def _get_snapshot_direct(self, all_elements: bool = False) -> Optional[str]:
-        """Try to get snapshot directly using page.evaluate (fastest method)"""
-        # Choose appropriate JS snapshot implementation
-        js_filename = "snapshot_complete.js" if all_elements else "snapshot.js"
-        js_path = Path(__file__).parent / js_filename
-
-        try:
-            js_code = js_path.read_text(encoding="utf-8")
-
-            result = self.page.evaluate(js_code)
-
-            return result
-        except Exception as e:
-            err_msg = str(e)
-            self._last_direct_error = err_msg
-            print(f"Error evaluating {js_filename}: {err_msg}")
-            return None
-
-    def _format_snapshot(self, snapshot_text: str) -> str:
-        """Format snapshot text consistently"""
-        formatted_snapshot = [
-            "- Page Snapshot",
-            "```yaml",
-            snapshot_text,
-            "```"
-        ]
-        return '\n'.join(formatted_snapshot)
-
-    def _update_cache(self, url: str, snapshot: str):
-        """Update cache with new snapshot data"""
-        self._last_url = url
-        self.snapshot_data = snapshot
-        # Create simple hash for content comparison
-        self._last_snapshot_hash = hash(snapshot)
-
-    def _get_snapshot_via_nodejs(self) -> Optional[str]:
-        """Try to get snapshot using Node.js version of Playwright"""
-        try:
-            # Get current page URL
-            current_url = self.page.url
-
-            # Check if snapshot_helper.js exists
-            script_path = os.path.join(os.getcwd(), 'snapshot_helper.js')
-            if not os.path.exists(script_path):
-                print("snapshot_helper.js not found, skipping Node.js method")
-                return None
-
-            # Set environment to ensure UTF-8 encoding
-            env = os.environ.copy()
-            env['PYTHONIOENCODING'] = 'utf-8'
-            if os.name == 'nt':  # Windows
-                env['CHCP'] = '65001'  # Set code page to UTF-8
-
-            # Call Node.js script with reduced timeout
-            cmd = ['node', 'snapshot_helper.js', 'snapshot', current_url]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=10,  # Reduced from 30s to 10s
-                encoding='utf-8',
-                errors='replace',
-                env=env
-            )
-
-            if result.returncode == 0:
-                # Parse JSON response
-                response_data = json.loads(result.stdout.strip())
-                if response_data.get('success'):
-                    print(
-                        "🚀 Using Node.js page._snapshotForAI() (official method)")
-                    return response_data.get('snapshot')
-                else:
-                    print(
-                        f"Node.js snapshot failed: {response_data.get('error')}")
-                    return None
-            else:
-                print(
-                    f"Node.js script failed with return code {result.returncode}")
-                if result.stderr:
-                    print(f"Error output: {result.stderr}")
-                return None
-
-        except subprocess.TimeoutExpired:
-            print("Node.js snapshot timeout")
-            return None
-        except FileNotFoundError:
-            print("Node.js not found in PATH")
-            return None
-        except json.JSONDecodeError:
-            print("Failed to parse Node.js response")
-            return None
-        except Exception as e:
-            print(f"Error calling Node.js snapshot: {e}")
-            return None
-
-    def _fallback_snapshot(self) -> str:
-        """Fallback method when _snapshotForAI is not available"""
-        try:
-            # Simple fallback that captures basic page info
-            title = self.page.title()
-            url = self.page.url
-
-            # Get basic text content from body
-            body_text = self.page.evaluate("""() => {
-                const body = document.body;
-                if (!body) return '';
-
-                // Get visible text content, but limit length
-                const text = body.textContent || '';
-                return text.trim().slice(0, 500);
-            }""")
-
-            fallback_snapshot = [
-                "- Page Snapshot",
-                "```yaml",
-                f"- generic [ref=e1]: {body_text}" if body_text else "- generic [ref=e1]: (no content)",
-                "```"
-            ]
-
-            return '\n'.join(fallback_snapshot)
-
-        except Exception as e:
-            print(f"Error in fallback snapshot: {e}")
-            return "Error: Could not capture page snapshot"
 
 
 class PlaywrightLLMAgent:
@@ -416,7 +191,7 @@ Determine the next action to take. If the task is complete, use 'finish' action 
 
         print(
             f"Sending {'initial plan' if is_initial else 'next action'} request to LLM")
-        response = chat_single(messages, mode="json", verbose=True)
+        response = chat_single(messages, mode="json", verbose=True,model='gpt-4o')
 
         # Ensure we return a dict or None
         if isinstance(response, dict):
@@ -1035,7 +810,13 @@ if __name__ == "__main__":
         # Navigate to target page
         # agent.navigate("")
         question = """
-在Amazon.de找一个最便宜的键盘添加到购物车
+https://www.nytimes.com/games/wordle/index.html
+玩一下这个游戏，你需要输入有意义的5个字母的单词，第一次输入apple
+输入的时候add e 按钮就是输入e字母，add a 就是输入a
+img "1st letter, E" 代表你输入的第一个字母是e 
+要观察之前点击了哪些字母，然后凑出有意义的5字母单词
+必须要有意义，不是随便输入5个字母
+总共尝试输入5次
         """
         # Process user command
         agent.process_command(question)
